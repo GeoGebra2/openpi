@@ -4,8 +4,8 @@ Only one selected camera is delayed. Its requested age starts at the lower
 bound, increases by a random 150-210 ms on each subsequent policy query until
 it reaches the upper bound, and resets on the following query. Simulator and
 video frames do not advance the ramp. The simulator is never paused or slept.
-The runner prints success rates; it does not invoke plotting or record video
-unless video is explicitly requested.
+The runner prints success rates and plots camera image ages per policy
+observation. Trajectory plots are not generated; video is opt-in.
 """
 
 from __future__ import annotations
@@ -58,6 +58,7 @@ class Args:
     num_steps_wait: int = 10
     max_steps: Optional[int] = None
     save_video: bool = False
+    save_delay_plots: bool = True
     video_fps: int = 20
     object_names: str = ""
     output_dir: str = "rollout/libero_increment_delay"
@@ -352,6 +353,115 @@ def save_summary(directory: pathlib.Path, args: Args, metadata: dict, records: l
     write_csv(directory / "success_rates.csv", report["aggregate"])
 
 
+def observation_delay_series(args: Args, record: dict, rows: list[dict]) -> dict:
+    """Measure camera ages from recorded query/source steps, not the planned ramp."""
+    if not rows or len(rows) != record["n_queries"]:
+        raise ValueError("Missing or miscounted observation delay rows")
+    for index, row in enumerate(rows):
+        if (row["condition"] != record["condition"]
+                or int(row["repeat_index"]) != record["repeat_index"]
+                or int(row["query_index"]) != index):
+            raise ValueError("Observation delay rows identify a different query/condition/repeat")
+    steps = np.asarray([int(row["step"]) for row in rows])
+    sources = np.asarray([
+        [int(row[key]) for key in ("agentview_source_step", "wrist_source_step", "state_source_step")]
+        for row in rows
+    ])
+    if not np.array_equal(steps, np.arange(len(rows)) * args.replan_steps):
+        raise ValueError("Observation steps do not match actual policy queries")
+    ages = (steps[:, None] - sources) * (1000.0 / args.control_hz)
+    effective = np.asarray([float(row["effective_ms"]) for row in rows])
+    selected = _shift.CAMERA_KEYS.index(args.delay_target)
+    expected = np.zeros_like(ages)
+    expected[:, selected] = effective
+    if (not np.all(np.isfinite(effective)) or np.any(effective < 0)
+            or not np.allclose(ages, expected, rtol=0, atol=1e-7)):
+        raise ValueError("Recorded source steps disagree with camera ages or current unselected inputs")
+    return {
+        "observation_index": np.arange(1, len(rows) + 1),
+        "agentview_ms": ages[:, 0],
+        "wrist_ms": ages[:, 1],
+        "max_ms": np.max(ages[:, :2], axis=1),
+        "gap_ms": np.abs(ages[:, 0] - ages[:, 1]),
+    }
+
+
+def write_observation_delay_plots(directory: pathlib.Path, args: Args, records: list[dict]) -> list[str]:
+    """Write one camera-age/gap figure per episode using its saved delay CSV."""
+    entries = []
+    for record in records:
+        if not record["n_queries"]:
+            continue
+        path = record.get("delay_schedule_path")
+        if not path:
+            raise ValueError("An episode with policy queries is missing its delay CSV")
+        with (directory / path).open(newline="", encoding="utf-8") as stream:
+            series = observation_delay_series(args, record, list(csv.DictReader(stream)))
+        entries.append((record, series))
+    if not entries:
+        return []
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    target = directory / "observation_delays"
+    target.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for record, series in entries:
+        fig, (top, bottom) = plt.subplots(
+            2, 1, figsize=(14, 7), sharex=True, gridspec_kw={"height_ratios": [2, 1]},
+        )
+        try:
+            x = series["observation_index"]
+            top.plot(x, series["max_ms"], color="0.3", linestyle="--", linewidth=2.4,
+                     alpha=0.65, label="Max over cameras", zorder=1)
+            top.plot(x, series["wrist_ms"], color="#267eaf", marker=".", markersize=4,
+                     linewidth=1, label="Wrist", zorder=2)
+            top.plot(x, series["agentview_ms"], color="#ec8b24", marker=".", markersize=4,
+                     linewidth=1, label="Agentview", zorder=2)
+            for value, label in ((args.delay_lower_ms, "lower"), (args.delay_upper_ms, "upper")):
+                top.axhline(value, color="0.55", linestyle=":", linewidth=1)
+                top.text(0.995, value, f" {label}: {value:g} ms", transform=top.get_yaxis_transform(),
+                         ha="right", va="bottom", fontsize=8, color="0.35")
+            median, p95 = np.percentile(series["max_ms"], [50, 95])
+            top.text(0.99, 0.97,
+                     f"Max-camera age: median {median:.1f} ms | P95 {p95:.1f} ms | "
+                     f"max {series['max_ms'].max():.1f} ms",
+                     transform=top.transAxes, ha="right", va="top", fontsize=9)
+            top.set_ylabel("Camera image age at observation (ms)")
+            top.legend(loc="upper left", ncol=3, fontsize=9)
+            bottom.plot(x, series["gap_ms"], color="#e54b4b", marker=".", markersize=4,
+                        linewidth=1, label="|Wrist age - Agentview age|")
+            bottom.fill_between(x, 0, series["gap_ms"], color="#e54b4b", alpha=0.08)
+            bottom.set(xlabel="Policy observation index (1-based)", ylabel="Camera age gap (ms)")
+            bottom.legend(loc="upper left", fontsize=9)
+            limit = max(args.delay_upper_ms, float(series["max_ms"].max()), 1)
+            for axis in (top, bottom):
+                axis.grid(alpha=0.2)
+                axis.set_ylim(-0.06 * limit, 1.16 * limit)
+            bottom.set_xlim(0.5, max(1.5, len(x) + 0.5))
+            bottom.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
+            fig.suptitle(
+                f"{args.task_suite_name} task {args.task_id} | {record['condition']} | "
+                f"repeat {record['repeat_index']} | {record['outcome']}\n"
+                f"Selected camera: {args.delay_target} | {len(x)} policy observations", fontsize=12,
+            )
+            fig.text(0.5, 0.015,
+                     "Age = (observation step - image source step) / control rate; "
+                     "simulation history age, excluding inference/network wall time.", ha="center", fontsize=9)
+            fig.tight_layout(rect=(0, 0.04, 1, 1))
+            path = target / f"{record['condition']}_repeat_{record['repeat_index']:03d}.png"
+            fig.savefig(path, dpi=160)
+            paths.append(path.relative_to(directory).as_posix())
+        finally:
+            plt.close(fig)
+    logging.info("Wrote %d observation-delay plots to %s", len(paths), target)
+    return paths
+
+
 def _preview(args: Args) -> pathlib.Path:
     validate_args(args)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
@@ -489,6 +599,8 @@ def run(args: Args) -> pathlib.Path:
     report = "\n".join(lines)
     (summary_path.parent / "success_rates.txt").write_text(report + "\n", encoding="utf-8")
     print(report)
+    if args.save_delay_plots:
+        write_observation_delay_plots(summary_path.parent, args, summary["records"])
     return summary_path
 
 
@@ -503,6 +615,9 @@ def parse_args(argv=None) -> Args:
         if field.name == "save_video":
             parser.add_argument(*flags, dest=field.name, action="store_true", default=False)
             parser.add_argument("--no-video", "--no_video", dest=field.name, action="store_false")
+        elif field.name == "save_delay_plots":
+            parser.add_argument(*flags, dest=field.name, action="store_true", default=True)
+            parser.add_argument("--no-delay-plots", "--no_delay_plots", dest=field.name, action="store_false")
         elif isinstance(default, bool):
             parser.add_argument(*flags, dest=field.name, action="store_true", default=default)
         else:

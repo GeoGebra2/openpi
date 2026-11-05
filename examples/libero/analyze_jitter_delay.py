@@ -173,10 +173,9 @@ def _delay_distribution(entries, rows_by_key, directory):
     plt.close(fig)
 
 
-def analyze(path, *, threshold_cm=2.0, consecutive=3, pair_limit=30, interactive=False):
+def analyze(path, *, threshold_cm=2.0, consecutive=3, pair_limit=30, interactive=False, delay_only=False):
     if not np.isfinite(threshold_cm) or threshold_cm <= 0 or consecutive < 1 or pair_limit < 0:
         raise ValueError("Invalid trajectory-analysis thresholds")
-    plt = _pyplot()
     path = pathlib.Path(path)
     summary_path = path / "summary.json" if path.is_dir() else path
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -193,6 +192,10 @@ def analyze(path, *, threshold_cm=2.0, consecutive=3, pair_limit=30, interactive
         raise ValueError("Saved conditions do not match the configuration")
     if args.preview_only:
         raise ValueError("This is a schedule-only preview, not collected task results")
+    observation_plots = _run.write_observation_delay_plots(summary_path.parent, args, summary["records"])
+    if delay_only:
+        return summary_path.parent / "observation_delays"
+    plt = _pyplot()
     directory = summary_path.parent / "increment_delay_analysis"
     directory.mkdir(parents=True, exist_ok=True)
     records = summary["records"]
@@ -276,6 +279,7 @@ def analyze(path, *, threshold_cm=2.0, consecutive=3, pair_limit=30, interactive
         "conditions": totals, "paired_success": comparisons,
         "excluded_runs": excluded, "missing_clean_pairs": missing_pairs,
         "validated_completed_traces": len(entries),
+        "observation_delay_plots": observation_plots,
         "interpretation": [
             "Delay advances per policy query, independent of video frames, simulation speed and inference wall time.",
             "Requested ages are clipped and rounded upward to available historical frames. Inspect the effective-age curves.",
@@ -298,4 +302,6 @@ if __name__ == "__main__":
     parser.add_argument("--consecutive", type=int, default=3)
     parser.add_argument("--pair-limit", type=int, default=30)
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--delay-only", "--delay_only", action="store_true",
+                        help="Only plot camera age per observation and camera age gaps; no trajectory analysis")
     print(analyze(**vars(parser.parse_args())))
