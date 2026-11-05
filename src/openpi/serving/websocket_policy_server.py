@@ -58,7 +58,22 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                if obs.get("_openpi_method") == "infer_drift_v2":
+                    action = self._policy.infer_drift(**obs["arguments"])
+                elif obs.get("_openpi_method") == "infer_token_drift":
+                    action = self._policy.infer_token_drift(**obs["arguments"])
+                elif obs.get("_openpi_method") == "infer_token_patch":
+                    action = self._policy.infer_token_patch(**obs["arguments"])
+                elif obs.get("_openpi_method") == "infer_wrist_patch":
+                    action = self._policy.infer_wrist_patch(**obs["arguments"])
+                elif obs.get("_openpi_method") == "infer_attention":
+                    action = self._policy.infer_attention(**obs["arguments"])
+                elif obs.get("_openpi_method") == "infer_action":
+                    action = self._policy.infer_action(**obs["arguments"])
+                elif obs.get("_openpi_method") == "infer":
+                    action = self._policy.infer(**obs["arguments"])
+                else:
+                    action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

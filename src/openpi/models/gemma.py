@@ -161,7 +161,7 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, capture_attention=False):  # noqa: FBT002
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -246,7 +246,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, (k, v), probs if capture_attention else None
 
 
 @at.typecheck
@@ -290,7 +290,18 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(
+        self,
+        xs,
+        kv_cache,
+        positions,
+        attn_mask,
+        adarms_cond,
+        deterministic=True,
+        capture_layer_tokens=False,  # noqa: FBT002
+        capture_attention=False,  # noqa: FBT002
+        hidden_patch=None,
+    ):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -305,7 +316,9 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache, attention = attn(
+            pre_attn, positions, attn_mask, kv_cache, capture_attention=capture_attention
+        )
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -330,10 +343,30 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        # Post-block residual stream intervention. This block's K/V have already
+        # been computed; the patched carry changes only subsequent blocks.
+        if hidden_patch is not None:
+            xs = [
+                jnp.where(patch[1][..., None], patch[0].astype(x.dtype), x)
+                if x is not None and patch is not None else x
+                for x, patch in zip(xs, hidden_patch, strict=True)
+            ]
+
+        # Capture the carry without modifying it; reductions use float32 for diagnostics.
+        embed_dtype = next(x.dtype for x in xs if x is not None)
+        layer_means = [
+            (x if capture_layer_tokens else jnp.mean(x.astype(jnp.float32), axis=1))
+            if x is not None
+            else jnp.zeros(config.width, dtype=embed_dtype)
+            for x, config in zip(xs, self.configs, strict=True)
+        ]
+
+        return xs, (kv_cache, layer_means, attention)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
+LayerMeans: TypeAlias = list[at.Float[at.Array, "l b _d"] | at.Float[at.Array, "l _d"]]
+LayerTokens: TypeAlias = list[at.Float[at.Array, "l b _t _d"] | at.Float[at.Array, "l _d"]]
 
 
 @at.typecheck
@@ -359,7 +392,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            static_argnums=(6, 7, 8),  # deterministic, capture_layer_tokens, capture_attention
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -372,7 +405,10 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                nn.broadcast,
+                nn.broadcast,
+                0,
+            ),  # kv_cache, positions, mask, adarms_cond, flags, and per-layer hidden_patch
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -396,19 +432,56 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        capture_layer_means: bool = False,
+        capture_layer_tokens: bool = False,
+        capture_attention: bool = False,  # noqa: FBT002
+        hidden_patch=None,
+    ) -> (
+        tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
+        | tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, LayerMeans]
+        | tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, LayerTokens]
+        | tuple[
+            Sequence[at.Float[at.Array, "b _t _d"] | None],
+            KVCache,
+            LayerTokens,
+            at.Float[at.Array, "l b k g t s"],
+        ]
+    ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
+        if hidden_patch is not None:
+            if len(hidden_patch) != len(embedded):
+                raise ValueError("Hidden patch must have one entry per expert")
+            for x, patch in zip(embedded, hidden_patch, strict=True):
+                if patch is not None:
+                    values, selected = patch
+                    if (
+                        x is None
+                        or values.shape != (self.configs[0].depth, *x.shape)
+                        or selected.shape != values.shape[:-1]
+                        or selected.dtype != jnp.bool_
+                    ):
+                        raise ValueError(
+                            "Hidden patch requires [layer,batch,token,width] values and boolean token masks"
+                        )
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        embedded, (kv_cache, layer_means, attention) = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic, capture_layer_tokens,
+            capture_attention, hidden_patch,
+        )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        outputs = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if capture_attention:
+            return outputs, kv_cache, layer_means, attention
+        if capture_layer_means or capture_layer_tokens:
+            return outputs, kv_cache, layer_means
+        return outputs, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
