@@ -21,8 +21,10 @@ from typing import Optional
 import numpy as np
 
 try:
+    from examples.libero import rollout_video as _video
     from examples.libero import run_shift_match_sweep as _shift
 except ImportError:
+    import rollout_video as _video
     import run_shift_match_sweep as _shift
 
 
@@ -148,7 +150,8 @@ def state_sample(env, obs, objects):
 
 def run_episode(*, args, client, task, initial_state, prompt, setting, repeat_index,
                 noise_shape, warmup_steps, history_steps, max_steps, output_dir,
-                delay_schedule=None, forced_replan_steps=(), frame_label=None):
+                delay_schedule=None, forced_replan_steps=(), frame_label=None,
+                capture_state_provenance=False, record_comparison_video=False):
     """Run a rollout, optionally changing observation age at selected steps.
 
     ``delay_schedule(step)`` returns an integer observation age. Boundary
@@ -161,9 +164,14 @@ def run_episode(*, args, client, task, initial_state, prompt, setting, repeat_in
     forced_replan_steps = frozenset(forced_replan_steps)
     history = {name: collections.deque(maxlen=history_steps + 1) for name in _shift.CAMERA_SOURCES}
     states = collections.deque(maxlen=history_steps + 1)
+    quaternions = collections.deque(maxlen=history_steps + 1)
+    query_current_states, query_source_states, query_current_quats, query_source_quats = [], [], [], []
     plan = collections.deque()
     outcome, reason, error_text = "failure", "max_steps", None
     actual_hz, objects, missing_objects, start_sim = None, [], [], np.empty(0)
+    slug = f"{setting.name}_repeat_{repeat_index:03d}"
+    video = (_video.ComparisonVideoRecorder(output_dir, slug, args.video_fps, args.control_hz, setting.target)
+             if args.save_video and record_comparison_video else None)
 
     def delay_at(step):
         value = setting.delay_steps if delay_schedule is None else delay_schedule(step)
@@ -171,7 +179,12 @@ def run_episode(*, args, client, task, initial_state, prompt, setting, repeat_in
             raise ValueError(f"Invalid scheduled delay {value!r} at step {step}")
         return int(value)
 
-    def save_frame(step, policy_obs, query, delay):
+    def save_frame(step, policy_obs, query, delay, terminal=None):
+        if video is not None:
+            video.capture(current_images={key: history[source][-1] for key, source in
+                                          zip(_shift.CAMERA_KEYS, _shift.CAMERA_SOURCES)},
+                          policy_obs=policy_obs, step=step, query=query, delay=delay, terminal=terminal)
+            return
         if args.save_video:
             frame = _shift._make_video_frame(
                 current_images={key: history[source][-1] for key, source in
@@ -205,9 +218,13 @@ def run_episode(*, args, client, task, initial_state, prompt, setting, repeat_in
         env.reset()
         obs = env.set_init_state(np.array(initial_state, copy=True))
         _shift._append_snapshot(history, states, obs, args.resize_size)
+        if capture_state_provenance:
+            quaternions.append(np.asarray(obs["robot0_eef_quat"], dtype=np.float64).copy())
         for _ in range(warmup_steps):
             obs, _, done, _ = env.step(_shift.LIBERO_DUMMY_ACTION)
             _shift._append_snapshot(history, states, obs, args.resize_size)
+            if capture_state_provenance:
+                quaternions.append(np.asarray(obs["robot0_eef_quat"], dtype=np.float64).copy())
             if done or env.check_success():
                 raise RuntimeError("Task ended during warmup; no valid trajectory comparison")
         objects, missing_objects = object_references(env, args.object_names)
@@ -221,6 +238,14 @@ def run_episode(*, args, client, task, initial_state, prompt, setting, repeat_in
             query = not plan
             save_frame(step, policy_obs, query, delay)
             if query:
+                if capture_state_provenance:
+                    if setting.target not in (*_shift.CAMERA_KEYS, _shift.BASELINE_TARGET):
+                        raise ValueError("State provenance capture requires current state and at most one delayed camera")
+                    source_delay = delay if setting.target in _shift.CAMERA_KEYS else 0
+                    query_current_states.append(states[-1].copy())
+                    query_source_states.append(states[-1 - source_delay].copy())
+                    query_current_quats.append(quaternions[-1].copy())
+                    query_source_quats.append(quaternions[-1 - source_delay].copy())
                 noise = paired_noise(args.seed, repeat_index, step, noise_shape)
                 response = client.infer_with_noise(policy_obs, noise)
                 chunk = np.asarray(response["actions"], dtype=np.float32)
@@ -244,6 +269,8 @@ def run_episode(*, args, client, task, initial_state, prompt, setting, repeat_in
             action_delays.append(query_delays[-1])
             samples.append(state_sample(env, obs, objects))
             _shift._append_snapshot(history, states, obs, args.resize_size)
+            if capture_state_provenance:
+                quaternions.append(np.asarray(obs["robot0_eef_quat"], dtype=np.float64).copy())
             if env.check_success():
                 outcome, reason = "success", "task_success"
                 break
@@ -251,22 +278,34 @@ def run_episode(*, args, client, task, initial_state, prompt, setting, repeat_in
                 reason = "environment_terminated_without_success"
                 break
         final_delay = delay_at(len(actions))
-        save_frame(len(actions), policy_observation(final_delay), False, final_delay)
+        save_frame(len(actions), policy_observation(final_delay), False, final_delay, terminal=outcome)
     except KeyboardInterrupt:
         outcome, reason, error_text = "interrupted", "interrupted", "KeyboardInterrupt"
     except Exception as error:
         outcome, reason, error_text = "error", "runtime_error", repr(error)
         logging.exception("Trajectory run failed: %s repeat=%d", setting.name, repeat_index)
     finally:
+        if video is not None:
+            if outcome in ("error", "interrupted") and samples:
+                save_frame(len(actions), {}, False, 0, terminal=outcome)
+            video_record = video.finish(outcome)
         if env is not None:
             try:
                 env.close()
             except Exception:
                 logging.exception("Environment cleanup failed")
 
-    slug = f"{setting.name}_repeat_{repeat_index:03d}"
     trace_path = output_dir / f"{slug}_trajectory.npz"
     arrays = {key: np.stack([sample[key] for sample in samples]) for key in samples[0]} if samples else {}
+    if capture_state_provenance:
+        # Source states are real measurements from this rollout, including
+        # negative source steps in warmup; never borrowed from paired clean.
+        arrays.update(
+            query_current_states=np.asarray(query_current_states, dtype=np.float32).reshape(-1, 8),
+            query_image_source_states=np.asarray(query_source_states, dtype=np.float32).reshape(-1, 8),
+            query_current_quats=np.asarray(query_current_quats, dtype=np.float64).reshape(-1, 4),
+            query_image_source_quats=np.asarray(query_source_quats, dtype=np.float64).reshape(-1, 4),
+        )
     np.savez_compressed(
         trace_path, **arrays,
         steps=np.arange(len(samples), dtype=np.int32),
@@ -283,8 +322,11 @@ def run_episode(*, args, client, task, initial_state, prompt, setting, repeat_in
         policy_states=np.asarray(policy_states, dtype=np.float32).reshape(-1, 8),
         object_names=np.asarray([name for name, _ in objects], dtype=str), start_sim_state=start_sim,
     )
-    video_path = output_dir / f"{slug}_{outcome}.mp4"
-    video_ok, video_error = _shift._save_video(video_path, frames, args.video_fps) if frames else (False, None)
+    if video is None:
+        video_path = output_dir / f"{slug}_{outcome}.mp4"
+        video_ok, video_error = _shift._save_video(video_path, frames, args.video_fps) if frames else (False, None)
+        video_record = {"video_path": video_path.name if video_ok else None,
+                        "video_fps": args.video_fps, "video_frames": len(frames), "video_error": video_error}
     return {
         "condition": setting.name, "repeat_index": repeat_index, "seed": args.seed + repeat_index,
         "task_suite_name": args.task_suite_name, "task_id": args.task_id, "initial_state_id": args.initial_state_id,
@@ -295,8 +337,7 @@ def run_episode(*, args, client, task, initial_state, prompt, setting, repeat_in
         "success": outcome == "success", "steps": len(actions), "n_samples": len(samples), "n_queries": len(queries),
         "n_delayed_queries": int(np.count_nonzero(query_delays)),
         "n_delayed_actions": int(np.count_nonzero(action_delays)),
-        "trace_path": trace_path.name, "video_path": video_path.name if video_ok else None,
-        "video_fps": args.video_fps, "video_frames": len(frames), "video_error": video_error,
+        "trace_path": trace_path.name, **video_record,
         "object_names": [name for name, _ in objects], "unavailable_objects": missing_objects, "error": error_text,
     }
 
